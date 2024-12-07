@@ -20,6 +20,7 @@
 //
 
 import Foundation
+import AudioStreaming
 import MediaPlayer
 import os.log
 
@@ -74,7 +75,7 @@ public class AmperKit {
     public lazy var player: PlayerFacade = {
         let audioSessionHandler = AudioSessionHandler()
         let backendAudioPlayer = BackendAudioPlayer(
-            createAVPlayerCB: { return AVPlayer() },
+            createAVPlayerCB: { return AudioStreaming.AudioPlayer() },
             audioSessionHandler: audioSessionHandler,
             eventLogger: eventLogger,
             backendApi: backendApi,

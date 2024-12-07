@@ -21,6 +21,7 @@
 
 import Foundation
 import AVFoundation
+import AudioStreaming
 import UIKit
 import os.log
 import PromiseKit
@@ -41,7 +42,14 @@ enum PlayType {
     case cache
 }
 
-public typealias CreateAVPlayerCallback = () -> AVPlayer
+enum BackendAudioQueueType {
+    case play
+    case queue
+}
+
+typealias NextPlayablePreloadCallback = () -> AbstractPlayable?
+
+public typealias CreateAVPlayerCallback = () -> AudioStreaming.AudioPlayer
 public typealias TriggerReinsertPlayableCallback = () -> Void
 
 class BackendAudioPlayer: NSObject {
@@ -51,10 +59,13 @@ class BackendAudioPlayer: NSObject {
     private let backendApi: BackendApi
     private let userStatistics: UserStatistics
     private let createAVPlayerCB: CreateAVPlayerCallback
-    private var player: AVPlayer
+    private var player: AudioStreaming.AudioPlayer
     private let eventLogger: EventLogger
     private let networkMonitor: NetworkMonitorFacade
-    private let updateElapsedTimeInterval = CMTime(seconds: 1.0, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+    private let updateElapsedTimeInterval = 0.5
+    private var elapsedTimeTimer: Timer?
+    private var nextPreloadedPlayable: AbstractPlayable?
+    public var nextPlayablePreloadCB: NextPlayablePreloadCallback?
     private let updateLyricsTimeInterval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
     private let fileManager = CacheFileManager.shared
     private var audioSessionHandler: AudioSessionHandler
@@ -71,7 +82,7 @@ class BackendAudioPlayer: NSObject {
             let streamingMaxBitrate = streamingMaxBitrates.getActive(networkMonitor: self.networkMonitor)
             os_log(.default, "Update Streaming Max Bitrate: %s %s", streamingMaxBitrate.description, (self.playType == .stream) ? "(active)" : "")
             if self.playType == .stream {
-                player.currentItem?.preferredPeakBitRate = streamingMaxBitrate.asBitsPerSecondAV
+                //player.currentItem?.preferredPeakBitRate = streamingMaxBitrate.asBitsPerSecondAV
             }
         }
     }
@@ -80,31 +91,22 @@ class BackendAudioPlayer: NSObject {
     public private(set) var playType: PlayType?
     
     var responder: BackendAudioPlayerNotifiable?
-    var isPlayableLoaded: Bool {
-        return player.currentItem?.status == AVPlayerItem.Status.readyToPlay
-    }
     var isStopped: Bool {
         return playType == nil
     }
     var elapsedTime: Double {
-        guard isPlayableLoaded else { return 0.0 }
-        let elapsedTimeInSeconds = player.currentTime().seconds
-        guard elapsedTimeInSeconds.isFinite else { return 0.0 }
-        return elapsedTimeInSeconds
+        return player.progress
     }
     var duration: Double {
-        guard isPlayableLoaded,
-              let duration = player.currentItem?.asset.duration.seconds,
-              duration.isFinite else {
-            return 0.0
-        }
+        let duration = player.duration
+        guard duration.isFinite else { return 0.0 }
         return duration
     }
     var playbackRate: PlaybackRate {
         return userDefinedPlaybackRate
     }
     var canBeContinued: Bool {
-        return player.currentItem != nil
+        return player.state == .paused
     }
     
     init(createAVPlayerCB: @escaping CreateAVPlayerCallback, audioSessionHandler: AudioSessionHandler, eventLogger: EventLogger, backendApi: BackendApi, networkMonitor: NetworkMonitorFacade, playableDownloader: DownloadManageable, cacheProxy: PlayableFileCachable, userStatistics: UserStatistics) {
@@ -125,17 +127,7 @@ class BackendAudioPlayer: NSObject {
     
     private func initAVPlayer() {
         player = createAVPlayerCB()
-        player.allowsExternalPlayback = false // Disable video transmission via AirPlay -> only audio
-        player.addPeriodicTimeObserver(forInterval: updateElapsedTimeInterval, queue: DispatchQueue.main) { [weak self] time in
-            if let self = self {
-                self.responder?.didElapsedTimeChange()
-            }
-        }
-        player.addPeriodicTimeObserver(forInterval: updateLyricsTimeInterval, queue: DispatchQueue.main) { [weak self] time in
-            if let self = self {
-                self.responder?.didLyricsTimeChange(time: time)
-            }
-        }
+        player.delegate = self
     }
     
     @objc private func itemFinishedPlaying() {
@@ -147,7 +139,7 @@ class BackendAudioPlayer: NSObject {
         player.pause()
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) {
             if self.isPlaying {
-                self.player.play()
+                //self.player.play()
             }
         }
     }
@@ -181,71 +173,71 @@ class BackendAudioPlayer: NSObject {
     
     func continuePlay() {
         isPlaying = true
-        player.play()
-        player.playImmediately(atRate: Float(userDefinedPlaybackRate.asDouble))
+        startElapsedTimeTimer()
+        player.resume()
     }
     
     func pause() {
         isPlaying = false
+        //stopElapsedTimeTimer()
         player.pause()
     }
     
     func stop() {
         isPlaying = false
+        stopElapsedTimeTimer()
         clearPlayer()
     }
     
     func setPlaybackRate(_ newValue: PlaybackRate) {
         userDefinedPlaybackRate = newValue
-        player.playImmediately(atRate: Float(newValue.asDouble))
+        player.rate = Float(newValue.asDouble)
     }
     
     func seek(toSecond: Double) {
-        player.seek(to: CMTime(seconds: toSecond, preferredTimescale: CMTimeScale(NSEC_PER_SEC)))
+        player.seek(to: toSecond)
     }
     
     func requestToPlay(playable: AbstractPlayable, playbackRate: PlaybackRate, autoStartPlayback: Bool) {
         userDefinedPlaybackRate = playbackRate
-        if let relFilePath = playable.relFilePath,
-           fileManager.fileExits(relFilePath: relFilePath) {
-            guard playable.isPlayableOniOS else {
-                reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
-                return
-            }
-            insertCachedPlayable(playable: playable)
-            if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
-                self.continuePlay()
-            } else {
-                isPlaying = false
-            }
-            self.responder?.notifyItemPreparationFinished()
-        } else if !isOfflineMode{
-            guard playable.isPlayableOniOS || backendApi.isStreamingTranscodingActive else {
-                reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
-                return
-            }
-            self.stop()
-            firstly {
-                insertStreamPlayable(playable: playable)
-            }.done {
-                if self.isAutoCachePlayedItems {
-                    self.playableDownloader.download(object: playable)
-                }
+
+        if let nextPreloadedPlayable = nextPreloadedPlayable, nextPreloadedPlayable == playable {
+            // Do nothing next preloaded playable has already been queued to player
+            self.nextPreloadedPlayable = nil
+        } else {
+            if let relFilePath = playable.relFilePath,
+               fileManager.fileExits(relFilePath: relFilePath) {
+                insertCachedPlayable(playable: playable)
                 if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
                     self.continuePlay()
                 } else {
-                    self.isPlaying = false
+                    isPlaying = false
                 }
-                self.responder?.notifyItemPreparationFinished()
-            }.catch { error in
-                self.responder?.notifyErrorOccured(error: error)
-                self.responder?.notifyItemPreparationFinished()
-                self.eventLogger.report(topic: "Player", error: error)
+            } else if !isOfflineMode{
+                firstly {
+                    insertStreamPlayable(playable: playable)
+                }.done {
+                    if self.isAutoCachePlayedItems {
+                        self.playableDownloader.download(object: playable)
+                    }
+                    if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
+                        self.continuePlay()
+                    } else {
+                        self.isPlaying = false
+                    }
+                    self.responder?.notifyItemPreparationFinished()
+                }.catch { error in
+                    self.responder?.notifyErrorOccured(error: error)
+                    self.responder?.notifyItemPreparationFinished()
+                    self.eventLogger.report(topic: "Player", error: error)
+                }
+            } else {
+                clearPlayer()
             }
-        } else {
-            clearPlayer()
-            self.responder?.notifyItemPreparationFinished()
         }
+        
+        self.responder?.notifyItemPreparationFinished()
+        startElapsedTimeTimer()
     }
     
     private func reactToIncompatibleContentType(contentType: String, playableDisplayTitle: String) {
@@ -256,21 +248,21 @@ class BackendAudioPlayer: NSObject {
     
     private func clearPlayer() {
         playType = nil
-        player.pause()
-        removeOldObserversAndReinitPlayer(item: nil)
+        player.stop()
+        stopElapsedTimeTimer()
     }
     
-    private func insertCachedPlayable(playable: AbstractPlayable) {
+    private func insertCachedPlayable(playable: AbstractPlayable, queueType: BackendAudioQueueType = .play) {
         guard let fileURL = cacheProxy.getFileURL(forPlayable: playable) else {
             return
         }
         os_log(.default, "Play item: %s", playable.displayString)
         playType = .cache
         if playable.isSong { userStatistics.playedSong(isPlayedFromCache: true) }
-        insert(playable: playable, withUrl: fileURL)
+        insert(playable: playable, withUrl: fileURL, queueType: queueType)
     }
     
-    private func insertStreamPlayable(playable: AbstractPlayable) -> Promise<Void> {
+    private func insertStreamPlayable(playable: AbstractPlayable, queueType: BackendAudioQueueType = .play) -> Promise<Void> {
         let streamingMaxBitrate = streamingMaxBitrates.getActive(networkMonitor: self.networkMonitor)
         return firstly {
             return backendApi.generateUrl(forStreamingPlayable: playable, maxBitrate: streamingMaxBitrate)
@@ -278,38 +270,89 @@ class BackendAudioPlayer: NSObject {
             os_log(.default, "Stream item (%s): %s", streamingMaxBitrate.description, playable.displayString)
             self.playType = .stream
             if playable.isSong { self.userStatistics.playedSong(isPlayedFromCache: false) }
-            self.insert(playable: playable, withUrl: streamUrl, streamingMaxBitrate: streamingMaxBitrate)
+            self.insert(playable: playable, withUrl: streamUrl, queueType: queueType, streamingMaxBitrate: streamingMaxBitrate)
         }.asVoid()
     }
 
-    private func insert(playable: AbstractPlayable, withUrl url: URL, streamingMaxBitrate: StreamingMaxBitratePreference = .noLimit) {
-        player.pause()
+    private func insert(playable: AbstractPlayable, withUrl url: URL, queueType: BackendAudioQueueType, streamingMaxBitrate: StreamingMaxBitratePreference = .noLimit) {
         audioSessionHandler.configureBackgroundPlayback()
-
-        removeOldObserversAndReinitPlayer(item: nil)
-        var item: AVPlayerItem?
-        if let mimeType = playable.iOsCompatibleContentType {
-            let asset: AVURLAsset = AVURLAsset(url: url, options: ["AVURLAssetOutOfBandMIMETypeKey" : mimeType])
-            item = AVPlayerItem(asset: asset)
-        } else {
-            item = AVPlayerItem(url: url)
+        switch queueType {
+        case .play:
+            player.play(url: url)
+        case .queue:
+            player.queue(url: url)
         }
-        item?.preferredPeakBitRate = streamingMaxBitrate.asBitsPerSecondAV
-        removeOldObserversAndReinitPlayer(item: item)
-        NotificationCenter.default.addObserver(self, selector: #selector(itemFinishedPlaying), name: NSNotification.Name.AVPlayerItemDidPlayToEndTime, object: player.currentItem)
-        NotificationCenter.default.addObserver(self, selector: #selector(itemPlaybackStalled(_:)), name: NSNotification.Name.AVPlayerItemPlaybackStalled, object: player.currentItem)
-        item?.addObserver(self, forKeyPath: "status", options: .new, context: nil)
+    }
+        
+    private func startElapsedTimeTimer() {
+        if elapsedTimeTimer == nil {
+            os_log(.default, "Player elapsed time start")
+            elapsedTimeTimer = Timer.scheduledTimer(timeInterval: updateElapsedTimeInterval, target: self, selector: #selector(elapsedTimeTimerTicked), userInfo: nil, repeats: true)
+        }
     }
     
-    private func removeOldObserversAndReinitPlayer(item: AVPlayerItem?) {
-        NotificationCenter.default.removeObserver(self, name: Notification.Name.AVPlayerItemDidPlayToEndTime, object: player.currentItem)
-        NotificationCenter.default.removeObserver(self, name: Notification.Name.AVPlayerItemPlaybackStalled, object: player.currentItem)
-        player.currentItem?.removeObserver(self, forKeyPath: "status", context: nil)
-        player.replaceCurrentItem(with: nil)
-        if let item = item {
-            initAVPlayer()
-            player.replaceCurrentItem(with: item)
+    private func stopElapsedTimeTimer() {
+        if let timer = elapsedTimeTimer {
+            os_log(.default, "Player elapsed time stop")
+            timer.invalidate()
+            elapsedTimeTimer = nil
         }
     }
+    
+    @objc func elapsedTimeTimerTicked() {
+        self.responder?.didElapsedTimeChange()
+        if nextPreloadedPlayable == nil, elapsedTime.isFinite, elapsedTime > 0, duration.isFinite, duration > 0 {
+            let remainingTime = duration - elapsedTime
+            if remainingTime > 0, remainingTime < 10 {
+                nextPreloadedPlayable = nextPlayablePreloadCB?()
+                guard let nextPreloadedPlayable = nextPreloadedPlayable else { return }
+                print("Next preload song is: \(nextPreloadedPlayable.displayString)")
+                if nextPreloadedPlayable.isCached {
+                    insertCachedPlayable(playable: nextPreloadedPlayable, queueType: .queue)
+                } else if !isOfflineMode{
+                    insertStreamPlayable(playable: nextPreloadedPlayable, queueType: .queue)
+                    if isAutoCachePlayedItems {
+                        playableDownloader.download(object: nextPreloadedPlayable)
+                    }
+                }
+            }
+        }
+    }
+}
 
+extension BackendAudioPlayer: AudioStreaming.AudioPlayerDelegate {
+    func audioPlayerDidStartPlaying(player: AudioStreaming.AudioPlayer, with entryId: AudioEntryId) {
+        print("audioPlayerDidStartPlaying")
+    }
+    
+    func audioPlayerDidFinishBuffering(player: AudioStreaming.AudioPlayer, with entryId: AudioEntryId) {
+        print("audioPlayerDidFinishBuffering")
+    }
+    
+    func audioPlayerStateChanged(player: AudioStreaming.AudioPlayer, with newState: AudioPlayerState, previous: AudioPlayerState) {
+        print("audioPlayerStateChanged \(previous) \(newState)")
+        if newState == .stopped {
+            itemFinishedPlaying()
+        }
+    }
+    
+    func audioPlayerDidFinishPlaying(player: AudioStreaming.AudioPlayer, entryId: AudioEntryId, stopReason: AudioPlayerStopReason, progress: Double, duration: Double) {
+        print("audioPlayerDidFinishPlaying")
+        if nextPreloadedPlayable != nil {
+            itemFinishedPlaying()
+        }
+    }
+    
+    func audioPlayerUnexpectedError(player: AudioStreaming.AudioPlayer, error: AudioPlayerError) {
+        print("audioPlayerUnexpectedError")
+    }
+    
+    func audioPlayerDidCancel(player: AudioStreaming.AudioPlayer, queuedItems: [AudioEntryId]) {
+        print("audioPlayerDidCancel")
+    }
+    
+    func audioPlayerDidReadMetadata(player: AudioStreaming.AudioPlayer, metadata: [String : String]) {
+        print("audioPlayerDidReadMetadata")
+    }
+    
 }

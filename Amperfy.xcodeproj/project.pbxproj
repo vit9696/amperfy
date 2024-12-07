@@ -453,6 +453,7 @@
 		638920F02C8C8E9000932EE8 /* SettingsList.swift in Sources */ = {isa = PBXBuildFile; fileRef = 638920EF2C8C8E9000932EE8 /* SettingsList.swift */; };
 		63DCDB7A2C674B5D00522F68 /* SettingsSceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63DCDB792C674B5D00522F68 /* SettingsSceneDelegate.swift */; };
 		641708592C13BF5100BA2619 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 641708582C13BF5100BA2619 /* Haptics.swift */; };
+		CEAA47DC2D04407100924578 /* AudioStreaming in Frameworks */ = {isa = PBXBuildFile; productRef = CEAA47DB2D04407100924578 /* AudioStreaming */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -1024,6 +1025,7 @@
 			files = (
 				507DFE642B1E5A03002BBB1D /* Alamofire in Frameworks */,
 				50F40A3B2C9088B30097FE63 /* IfritStatic in Frameworks */,
+				CEAA47DC2D04407100924578 /* AudioStreaming in Frameworks */,
 				507DFE682B1E5A1A002BBB1D /* PromiseKit in Frameworks */,
 				50CF3CEF28A4F83100263F7C /* CryptoKit.framework in Frameworks */,
 				507DFE6A2B1E62C9002BBB1D /* ID3TagEditor in Frameworks */,
@@ -1990,6 +1992,7 @@
 				507DFE672B1E5A1A002BBB1D /* PromiseKit */,
 				507DFE692B1E62C9002BBB1D /* ID3TagEditor */,
 				50F40A3A2C9088B30097FE63 /* IfritStatic */,
+				CEAA47DB2D04407100924578 /* AudioStreaming */,
 			);
 			productName = AmpertyKit;
 			productReference = 50C9D605284FA847007F18D0 /* AmperfyKit.framework */;
@@ -2072,6 +2075,7 @@
 				507DFE562B1E58B6002BBB1D /* XCRemoteSwiftPackageReference "PromiseKit" */,
 				507DFE592B1E58CB002BBB1D /* XCRemoteSwiftPackageReference "PMKAlamofire" */,
 				50F40A392C9088B30097FE63 /* XCRemoteSwiftPackageReference "Ifrit" */,
+				CEAA47D82D043FD700924578 /* XCRemoteSwiftPackageReference "AudioStreaming" */,
 			);
 			productRefGroup = 508385E521C5965B00C4BB32 /* Products */;
 			projectDirPath = "";
@@ -3136,6 +3140,14 @@
 				version = 2.0.3;
 			};
 		};
+		CEAA47D82D043FD700924578 /* XCRemoteSwiftPackageReference "AudioStreaming" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/dimitris-c/AudioStreaming";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.6;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -3218,6 +3230,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 50F40A392C9088B30097FE63 /* XCRemoteSwiftPackageReference "Ifrit" */;
 			productName = IfritStatic;
+		};
+		CEAA47DB2D04407100924578 /* AudioStreaming */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CEAA47D82D043FD700924578 /* XCRemoteSwiftPackageReference "AudioStreaming" */;
+			productName = AudioStreaming;
 		};
 /* End XCSwiftPackageProductDependency section */
 
