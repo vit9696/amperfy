@@ -41,7 +41,14 @@ enum PlayType {
     case cache
 }
 
-public typealias CreateAVPlayerCallback = () -> AVPlayer
+enum BackendAudioQueueType {
+    case play
+    case queue
+}
+
+typealias NextPlayablePreloadCallback = () -> AbstractPlayable?
+
+public typealias CreateAVPlayerCallback = () -> AVQueuePlayer
 public typealias TriggerReinsertPlayableCallback = () -> Void
 
 class BackendAudioPlayer: NSObject {
@@ -51,10 +58,13 @@ class BackendAudioPlayer: NSObject {
     private let backendApi: BackendApi
     private let userStatistics: UserStatistics
     private let createAVPlayerCB: CreateAVPlayerCallback
-    private var player: AVPlayer
+    private var player: AVQueuePlayer
     private let eventLogger: EventLogger
     private let networkMonitor: NetworkMonitorFacade
-    private let updateElapsedTimeInterval = CMTime(seconds: 1.0, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+    private let updateElapsedTimeInterval = CMTime(seconds: 0.5, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+    private var elapsedTimeTimer: Timer?
+    private var nextPreloadedPlayable: AbstractPlayable?
+    public var nextPlayablePreloadCB: NextPlayablePreloadCallback?
     private let updateLyricsTimeInterval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
     private let fileManager = CacheFileManager.shared
     private var audioSessionHandler: AudioSessionHandler
@@ -181,6 +191,7 @@ class BackendAudioPlayer: NSObject {
     
     func continuePlay() {
         isPlaying = true
+        startElapsedTimeTimer()
         player.play()
         player.playImmediately(atRate: Float(userDefinedPlaybackRate.asDouble))
     }
@@ -192,6 +203,7 @@ class BackendAudioPlayer: NSObject {
     
     func stop() {
         isPlaying = false
+        stopElapsedTimeTimer()
         clearPlayer()
     }
     
@@ -206,47 +218,55 @@ class BackendAudioPlayer: NSObject {
     
     func requestToPlay(playable: AbstractPlayable, playbackRate: PlaybackRate, autoStartPlayback: Bool) {
         userDefinedPlaybackRate = playbackRate
-        if let relFilePath = playable.relFilePath,
-           fileManager.fileExits(relFilePath: relFilePath) {
-            guard playable.isPlayableOniOS else {
-                reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
-                return
-            }
-            insertCachedPlayable(playable: playable)
-            if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
-                self.continuePlay()
-            } else {
-                isPlaying = false
-            }
-            self.responder?.notifyItemPreparationFinished()
-        } else if !isOfflineMode{
-            guard playable.isPlayableOniOS || backendApi.isStreamingTranscodingActive else {
-                reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
-                return
-            }
-            self.stop()
-            firstly {
-                insertStreamPlayable(playable: playable)
-            }.done {
-                if self.isAutoCachePlayedItems {
-                    self.playableDownloader.download(object: playable)
+
+        if let nextPreloadedPlayable = nextPreloadedPlayable, nextPreloadedPlayable == playable {
+            // Do nothing next preloaded playable has already been queued to player
+            self.nextPreloadedPlayable = nil
+        } else {
+            if let relFilePath = playable.relFilePath,
+               fileManager.fileExits(relFilePath: relFilePath) {
+                guard playable.isPlayableOniOS else {
+                    reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
+                    return
                 }
+                insertCachedPlayable(playable: playable)
                 if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
                     self.continuePlay()
                 } else {
-                    self.isPlaying = false
+                    isPlaying = false
                 }
-                self.responder?.notifyItemPreparationFinished()
-            }.catch { error in
-                self.responder?.notifyErrorOccured(error: error)
-                self.responder?.notifyItemPreparationFinished()
-                self.eventLogger.report(topic: "Player", error: error)
+            } else if !isOfflineMode{
+                guard playable.isPlayableOniOS || backendApi.isStreamingTranscodingActive else {
+                    reactToIncompatibleContentType(contentType: playable.fileContentType ?? "", playableDisplayTitle: playable.displayString)
+                    return
+                }
+                self.stop()
+                firstly {
+                    insertStreamPlayable(playable: playable)
+                }.done {
+                    if self.isAutoCachePlayedItems {
+                        self.playableDownloader.download(object: playable)
+                    }
+                    if (!self.isErrorOccured && autoStartPlayback) || (self.isErrorOccured && self.wasPlayingBeforeErrorOccured) {
+                        self.continuePlay()
+                    } else {
+                        self.isPlaying = false
+                    }
+                    self.responder?.notifyItemPreparationFinished()
+                }.catch { error in
+                    self.responder?.notifyErrorOccured(error: error)
+                    self.responder?.notifyItemPreparationFinished()
+                    self.eventLogger.report(topic: "Player", error: error)
+                }
+            } else {
+                clearPlayer()
             }
-        } else {
-            clearPlayer()
-            self.responder?.notifyItemPreparationFinished()
         }
+        
+        self.responder?.notifyItemPreparationFinished()
+        startElapsedTimeTimer()
     }
+
     
     private func reactToIncompatibleContentType(contentType: String, playableDisplayTitle: String) {
         clearPlayer()
@@ -257,20 +277,21 @@ class BackendAudioPlayer: NSObject {
     private func clearPlayer() {
         playType = nil
         player.pause()
+        stopElapsedTimeTimer()
         removeOldObserversAndReinitPlayer(item: nil)
     }
     
-    private func insertCachedPlayable(playable: AbstractPlayable) {
+    private func insertCachedPlayable(playable: AbstractPlayable, queueType: BackendAudioQueueType = .play) {
         guard let fileURL = cacheProxy.getFileURL(forPlayable: playable) else {
             return
         }
         os_log(.default, "Play item: %s", playable.displayString)
         playType = .cache
         if playable.isSong { userStatistics.playedSong(isPlayedFromCache: true) }
-        insert(playable: playable, withUrl: fileURL)
+        insert(playable: playable, withUrl: fileURL, queueType: queueType)
     }
     
-    private func insertStreamPlayable(playable: AbstractPlayable) -> Promise<Void> {
+    private func insertStreamPlayable(playable: AbstractPlayable, queueType: BackendAudioQueueType = .play) -> Promise<Void> {
         let streamingMaxBitrate = streamingMaxBitrates.getActive(networkMonitor: self.networkMonitor)
         return firstly {
             return backendApi.generateUrl(forStreamingPlayable: playable, maxBitrate: streamingMaxBitrate)
@@ -278,15 +299,12 @@ class BackendAudioPlayer: NSObject {
             os_log(.default, "Stream item (%s): %s", streamingMaxBitrate.description, playable.displayString)
             self.playType = .stream
             if playable.isSong { self.userStatistics.playedSong(isPlayedFromCache: false) }
-            self.insert(playable: playable, withUrl: streamUrl, streamingMaxBitrate: streamingMaxBitrate)
+            self.insert(playable: playable, withUrl: streamUrl, queueType: queueType, streamingMaxBitrate: streamingMaxBitrate)
         }.asVoid()
     }
 
-    private func insert(playable: AbstractPlayable, withUrl url: URL, streamingMaxBitrate: StreamingMaxBitratePreference = .noLimit) {
-        player.pause()
-        audioSessionHandler.configureBackgroundPlayback()
+    private func insert(playable: AbstractPlayable, withUrl url: URL, queueType: BackendAudioQueueType, streamingMaxBitrate: StreamingMaxBitratePreference = .noLimit) {
 
-        removeOldObserversAndReinitPlayer(item: nil)
         var item: AVPlayerItem?
         if let mimeType = playable.iOsCompatibleContentType {
             let asset: AVURLAsset = AVURLAsset(url: url, options: ["AVURLAssetOutOfBandMIMETypeKey" : mimeType])
@@ -295,10 +313,15 @@ class BackendAudioPlayer: NSObject {
             item = AVPlayerItem(url: url)
         }
         item?.preferredPeakBitRate = streamingMaxBitrate.asBitsPerSecondAV
-        removeOldObserversAndReinitPlayer(item: item)
-        NotificationCenter.default.addObserver(self, selector: #selector(itemFinishedPlaying), name: NSNotification.Name.AVPlayerItemDidPlayToEndTime, object: player.currentItem)
-        NotificationCenter.default.addObserver(self, selector: #selector(itemPlaybackStalled(_:)), name: NSNotification.Name.AVPlayerItemPlaybackStalled, object: player.currentItem)
-        item?.addObserver(self, forKeyPath: "status", options: .new, context: nil)
+        if (queueType == .play) {
+            audioSessionHandler.configureBackgroundPlayback()
+            removeOldObserversAndReinitPlayer(item: item)
+            //NotificationCenter.default.addObserver(self, selector: #selector(itemFinishedPlaying), name: NSNotification.Name.AVPlayerItemDidPlayToEndTime, object: player.currentItem)
+            NotificationCenter.default.addObserver(self, selector: #selector(itemPlaybackStalled(_:)), name: NSNotification.Name.AVPlayerItemPlaybackStalled, object: player.currentItem)
+            item?.addObserver(self, forKeyPath: "status", options: .new, context: nil)
+        } else {
+            player.insert(item!, after: nil)
+        }
     }
     
     private func removeOldObserversAndReinitPlayer(item: AVPlayerItem?) {
@@ -312,4 +335,38 @@ class BackendAudioPlayer: NSObject {
         }
     }
 
+    private func startElapsedTimeTimer() {
+        if elapsedTimeTimer == nil {
+            os_log(.default, "Player elapsed time start")
+            elapsedTimeTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(elapsedTimeTimerTicked), userInfo: nil, repeats: true)
+        }
+    }
+    
+    private func stopElapsedTimeTimer() {
+        if let timer = elapsedTimeTimer {
+            os_log(.default, "Player elapsed time stop")
+            timer.invalidate()
+            elapsedTimeTimer = nil
+        }
+    }
+    
+    @objc func elapsedTimeTimerTicked() {
+        self.responder?.didElapsedTimeChange()
+        if nextPreloadedPlayable == nil, elapsedTime.isFinite, elapsedTime > 0, duration.isFinite, duration > 0 {
+            let remainingTime = duration - elapsedTime
+            if remainingTime > 0, remainingTime < 30 {
+                nextPreloadedPlayable = nextPlayablePreloadCB?()
+                guard let nextPreloadedPlayable = nextPreloadedPlayable else { return }
+                print("Next preload song is: \(nextPreloadedPlayable.displayString)")
+                if nextPreloadedPlayable.isCached {
+                    insertCachedPlayable(playable: nextPreloadedPlayable, queueType: .queue)
+                } else if !isOfflineMode{
+                    insertStreamPlayable(playable: nextPreloadedPlayable, queueType: .queue)
+                    if isAutoCachePlayedItems {
+                        playableDownloader.download(object: nextPreloadedPlayable)
+                    }
+                }
+            }
+        }
+    }
 }

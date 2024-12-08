@@ -58,6 +58,10 @@ public class AudioPlayer: NSObject, BackendAudioPlayerNotifiable  {
         self.userStatistics = userStatistics
         super.init()
         self.backendAudioPlayer.responder = self
+        self.backendAudioPlayer.nextPlayablePreloadCB = { () in
+            guard let nextPlayerIndex = self.nextPlayerIndex else { return nil }
+            return self.queueHandler.getPlayable(at: nextPlayerIndex)
+        }
     }
 
     func reinit(playerStatus: PlayerData, queueHandler: PlayQueueHandler) {
@@ -99,7 +103,7 @@ public class AudioPlayer: NSObject, BackendAudioPlayerNotifiable  {
         } else if playerStatus.repeatMode == .single {
             replayCurrentItem()
         } else {
-            playNext()
+            //playNext()
         }
     }
     
@@ -166,14 +170,22 @@ public class AudioPlayer: NSObject, BackendAudioPlayerNotifiable  {
 
     //BackendAudioPlayerNotifiable
     func playNext() {
-        if queueHandler.userQueue.count > 0 {
-            play(playerIndex: PlayerIndex(queueType: .user, index: 0))
-        } else if queueHandler.nextQueue.count > 0 {
-            play(playerIndex: PlayerIndex(queueType: .next, index: 0))
-        } else if playerStatus.repeatMode == .all, !queueHandler.prevQueue.isEmpty {
-            play(playerIndex: PlayerIndex(queueType: .prev, index: 0))
+        if let nextPlayerIndex = nextPlayerIndex {
+            play(playerIndex: nextPlayerIndex)
         } else {
             stop()
+        }
+    }
+
+    private var nextPlayerIndex: PlayerIndex? {
+        if queueHandler.userQueue.count > 0 {
+            return PlayerIndex(queueType: .user, index: 0)
+        } else if queueHandler.nextQueue.count > 0 {
+            return PlayerIndex(queueType: .next, index: 0)
+        } else if playerStatus.repeatMode == .all, !queueHandler.prevQueue.isEmpty {
+            return PlayerIndex(queueType: .prev, index: 0)
+        } else {
+            return nil
         }
     }
     
